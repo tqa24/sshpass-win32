@@ -440,10 +440,11 @@ static void WritePass(Context* ctx) {
 static void __cdecl InputHandlerThread(LPVOID arg) {
     Context* ctx = arg;
     HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
-    DWORD mode;
+    DWORD mode, originalMode;
 
     GetConsoleMode(hStdin, &mode);
-    mode &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
+    originalMode = mode;
+    mode &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
     mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
     SetConsoleMode(hStdin, mode);
 
@@ -460,5 +461,5 @@ static void __cdecl InputHandlerThread(LPVOID arg) {
         }
     }
 
-    SetConsoleMode(hStdin, mode);
+    SetConsoleMode(hStdin, originalMode);
 }

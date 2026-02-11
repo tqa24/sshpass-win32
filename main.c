@@ -38,6 +38,8 @@ typedef struct {
     HANDLE stdOut;
 
     HANDLE events[2];
+    HANDLE inputHandler;
+    DWORD originalConsoleMode;
 } Context;
 
 static void ParseArgs(int argc, const wchar_t** wargv, char** argv, Context* ctx);
@@ -47,6 +49,7 @@ static HRESULT InitializeStartupInfoAttachedToPseudoConsole(STARTUPINFOEXW* star
                                                             HPCON hpcon);
 static void __cdecl PipeListener(LPVOID);
 static void __cdecl InputHandlerThread(LPVOID);
+static void CloseInputHandler(Context* ctx);
 
 static wchar_t* ToUtf16(const char* utf8) {
     if (utf8 == NULL) {
@@ -127,10 +130,14 @@ int wmain(int argc, const wchar_t* argv[]) {
     ctx.pipeIn = INVALID_HANDLE_VALUE;
     ctx.pipeOut = INVALID_HANDLE_VALUE;
     ctx.stdOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    ctx.inputHandler = INVALID_HANDLE_VALUE;
     ctx.events[0] = CreateEvent(NULL, FALSE, FALSE, NULL);
     if (ctx.events[0] == NULL) {
         return EXIT_FAILURE;
     }
+
+    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+    GetConsoleMode(hStdin, &ctx.originalConsoleMode);
 
     DWORD consoleMode = 0;
     GetConsoleMode(ctx.stdOut, &consoleMode);
@@ -154,10 +161,12 @@ int wmain(int argc, const wchar_t* argv[]) {
             if (S_OK == hr) {
                 ctx.events[1] = cmdProc.hThread;
 
-                HANDLE inputHandler = (HANDLE) _beginthread(InputHandlerThread, 0, &ctx);
+                ctx.inputHandler = (HANDLE) _beginthread(InputHandlerThread, 0, &ctx);
 
                 WaitForMultipleObjects(sizeof(ctx.events) / sizeof(HANDLE), ctx.events, FALSE,
                                         INFINITE);
+
+                CloseInputHandler(&ctx);
 
                 GetExitCodeProcess(cmdProc.hProcess, &childExitCode);
             }
@@ -440,26 +449,42 @@ static void WritePass(Context* ctx) {
 static void __cdecl InputHandlerThread(LPVOID arg) {
     Context* ctx = arg;
     HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
-    DWORD mode, originalMode;
+    DWORD mode;
 
     GetConsoleMode(hStdin, &mode);
-    originalMode = mode;
     mode &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
     mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
     SetConsoleMode(hStdin, mode);
 
-    char buffer;
-    DWORD bytesRead, bytesWritten;
+    wchar_t buffer[64];
+    DWORD charsRead, bytesWritten;
 
     while (1) {
-        if (!ReadFile(hStdin, &buffer, 1, &bytesRead, NULL) || bytesRead == 0) {
+        if (!ReadConsoleW(hStdin, buffer, sizeof(buffer) / sizeof(wchar_t), &charsRead, NULL) || charsRead == 0) {
             break;
         }
 
-        if (!WriteFile(ctx->pipeOut, &buffer, 1, &bytesWritten, NULL)) {
-            break;
+        char utf8Buffer[256];
+        int utf8Len = WideCharToMultiByte(CP_UTF8, 0, buffer, charsRead, utf8Buffer, sizeof(utf8Buffer), NULL, NULL);
+        if (utf8Len > 0) {
+            if (!WriteFile(ctx->pipeOut, utf8Buffer, utf8Len, &bytesWritten, NULL)) {
+                break;
+            }
         }
     }
+}
 
-    SetConsoleMode(hStdin, originalMode);
+static void CloseInputHandler(Context* ctx) {
+    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+
+    if (ctx->pipeOut != INVALID_HANDLE_VALUE) {
+        CloseHandle(ctx->pipeOut);
+        ctx->pipeOut = INVALID_HANDLE_VALUE;
+    }
+
+    if (ctx->inputHandler != INVALID_HANDLE_VALUE) {
+        WaitForSingleObject(ctx->inputHandler, 1000);
+    }
+
+    SetConsoleMode(hStdin, ctx->originalConsoleMode);
 }

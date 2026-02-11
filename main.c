@@ -40,6 +40,7 @@ typedef struct {
     HANDLE events[2];
     HANDLE inputHandler;
     DWORD originalConsoleMode;
+    HPCON hpcon;
 } Context;
 
 static void ParseArgs(int argc, const wchar_t** wargv, char** argv, Context* ctx);
@@ -49,6 +50,7 @@ static HRESULT InitializeStartupInfoAttachedToPseudoConsole(STARTUPINFOEXW* star
                                                             HPCON hpcon);
 static void __cdecl PipeListener(LPVOID);
 static void __cdecl InputHandlerThread(LPVOID);
+static void __cdecl ResizeHandlerThread(LPVOID);
 static void CloseInputHandler(Context* ctx);
 
 static wchar_t* ToUtf16(const char* utf8) {
@@ -147,6 +149,7 @@ int wmain(int argc, const wchar_t* argv[]) {
 
     hr = CreatePseudoConsoleAndPipes(&hpcon, &ctx);
     if (S_OK == hr) {
+        ctx.hpcon = hpcon;
         HANDLE pipeListener = (HANDLE) _beginthread(PipeListener, 0, &ctx);
 
         STARTUPINFOEXW startupInfo = {0};
@@ -162,6 +165,7 @@ int wmain(int argc, const wchar_t* argv[]) {
                 ctx.events[1] = cmdProc.hThread;
 
                 ctx.inputHandler = (HANDLE) _beginthread(InputHandlerThread, 0, &ctx);
+                _beginthread(ResizeHandlerThread, 0, &ctx);
 
                 WaitForMultipleObjects(sizeof(ctx.events) / sizeof(HANDLE), ctx.events, FALSE,
                                         INFINITE);
@@ -344,6 +348,7 @@ typedef enum { INIT, VERIFY, EXEC, END } State;
 
 static State ProcessOutput(Context* ctx, const char* buffer, DWORD len, State state) {
     State nextState;
+    DWORD written;
     switch (state) {
     case INIT: {
         if (!IsWaitInputPass(ctx, buffer, len)) {
@@ -358,12 +363,12 @@ static State ProcessOutput(Context* ctx, const char* buffer, DWORD len, State st
             fprintf(stderr, "Password is error!");
             nextState = END;
         } else {
-            fprintf(stdout, "%s", buffer);
+            WriteFile(ctx->stdOut, buffer, len, &written, NULL);
             nextState = EXEC;
         }
     } break;
     case EXEC: {
-        fprintf(stdout, "%s", buffer);
+        WriteFile(ctx->stdOut, buffer, len, &written, NULL);
         nextState = EXEC;
     } break;
     case END: {
@@ -487,4 +492,30 @@ static void CloseInputHandler(Context* ctx) {
     }
 
     SetConsoleMode(hStdin, ctx->originalConsoleMode);
+}
+
+static void __cdecl ResizeHandlerThread(LPVOID arg) {
+    Context* ctx = arg;
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    COORD currentSize = {0, 0};
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+
+    if (GetConsoleScreenBufferInfo(hConsole, &csbi)) {
+        currentSize.X = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+        currentSize.Y = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+    }
+
+    while (WaitForMultipleObjects(sizeof(ctx->events) / sizeof(HANDLE), ctx->events, FALSE, 100) ==
+           WAIT_TIMEOUT) {
+        if (GetConsoleScreenBufferInfo(hConsole, &csbi)) {
+            COORD newSize;
+            newSize.X = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+            newSize.Y = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+
+            if (newSize.X != currentSize.X || newSize.Y != currentSize.Y) {
+                currentSize = newSize;
+                ResizePseudoConsole(ctx->hpcon, currentSize);
+            }
+        }
+    }
 }

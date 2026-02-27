@@ -38,6 +38,9 @@ typedef struct {
     HANDLE stdOut;
 
     HANDLE events[2];
+    HANDLE inputHandler;
+    DWORD originalConsoleMode;
+    HPCON hpcon;
 } Context;
 
 static void ParseArgs(int argc, const wchar_t** wargv, char** argv, Context* ctx);
@@ -47,6 +50,8 @@ static HRESULT InitializeStartupInfoAttachedToPseudoConsole(STARTUPINFOEXW* star
                                                             HPCON hpcon);
 static void __cdecl PipeListener(LPVOID);
 static void __cdecl InputHandlerThread(LPVOID);
+static void __cdecl ResizeHandlerThread(LPVOID);
+static void CloseInputHandler(Context* ctx);
 
 static wchar_t* ToUtf16(const char* utf8) {
     if (utf8 == NULL) {
@@ -127,10 +132,14 @@ int wmain(int argc, const wchar_t* argv[]) {
     ctx.pipeIn = INVALID_HANDLE_VALUE;
     ctx.pipeOut = INVALID_HANDLE_VALUE;
     ctx.stdOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    ctx.inputHandler = INVALID_HANDLE_VALUE;
     ctx.events[0] = CreateEvent(NULL, FALSE, FALSE, NULL);
     if (ctx.events[0] == NULL) {
         return EXIT_FAILURE;
     }
+
+    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+    GetConsoleMode(hStdin, &ctx.originalConsoleMode);
 
     DWORD consoleMode = 0;
     GetConsoleMode(ctx.stdOut, &consoleMode);
@@ -140,6 +149,7 @@ int wmain(int argc, const wchar_t* argv[]) {
 
     hr = CreatePseudoConsoleAndPipes(&hpcon, &ctx);
     if (S_OK == hr) {
+        ctx.hpcon = hpcon;
         HANDLE pipeListener = (HANDLE) _beginthread(PipeListener, 0, &ctx);
 
         STARTUPINFOEXW startupInfo = {0};
@@ -154,10 +164,13 @@ int wmain(int argc, const wchar_t* argv[]) {
             if (S_OK == hr) {
                 ctx.events[1] = cmdProc.hThread;
 
-                HANDLE inputHandler = (HANDLE) _beginthread(InputHandlerThread, 0, &ctx);
+                ctx.inputHandler = (HANDLE) _beginthread(InputHandlerThread, 0, &ctx);
+                _beginthread(ResizeHandlerThread, 0, &ctx);
 
                 WaitForMultipleObjects(sizeof(ctx.events) / sizeof(HANDLE), ctx.events, FALSE,
                                         INFINITE);
+
+                CloseInputHandler(&ctx);
 
                 GetExitCodeProcess(cmdProc.hProcess, &childExitCode);
             }
@@ -335,6 +348,7 @@ typedef enum { INIT, VERIFY, EXEC, END } State;
 
 static State ProcessOutput(Context* ctx, const char* buffer, DWORD len, State state) {
     State nextState;
+    DWORD written;
     switch (state) {
     case INIT: {
         if (!IsWaitInputPass(ctx, buffer, len)) {
@@ -349,12 +363,12 @@ static State ProcessOutput(Context* ctx, const char* buffer, DWORD len, State st
             fprintf(stderr, "Password is error!");
             nextState = END;
         } else {
-            fprintf(stdout, "%s", buffer);
+            WriteFile(ctx->stdOut, buffer, len, &written, NULL);
             nextState = EXEC;
         }
     } break;
     case EXEC: {
-        fprintf(stdout, "%s", buffer);
+        WriteFile(ctx->stdOut, buffer, len, &written, NULL);
         nextState = EXEC;
     } break;
     case END: {
@@ -443,22 +457,65 @@ static void __cdecl InputHandlerThread(LPVOID arg) {
     DWORD mode;
 
     GetConsoleMode(hStdin, &mode);
-    mode &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
+    mode &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
     mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
     SetConsoleMode(hStdin, mode);
 
-    char buffer;
-    DWORD bytesRead, bytesWritten;
+    wchar_t buffer[64];
+    DWORD charsRead, bytesWritten;
 
     while (1) {
-        if (!ReadFile(hStdin, &buffer, 1, &bytesRead, NULL) || bytesRead == 0) {
+        if (!ReadConsoleW(hStdin, buffer, sizeof(buffer) / sizeof(wchar_t), &charsRead, NULL) || charsRead == 0) {
             break;
         }
 
-        if (!WriteFile(ctx->pipeOut, &buffer, 1, &bytesWritten, NULL)) {
-            break;
+        char utf8Buffer[256];
+        int utf8Len = WideCharToMultiByte(CP_UTF8, 0, buffer, charsRead, utf8Buffer, sizeof(utf8Buffer), NULL, NULL);
+        if (utf8Len > 0) {
+            if (!WriteFile(ctx->pipeOut, utf8Buffer, utf8Len, &bytesWritten, NULL)) {
+                break;
+            }
         }
     }
+}
 
-    SetConsoleMode(hStdin, mode);
+static void CloseInputHandler(Context* ctx) {
+    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+
+    if (ctx->pipeOut != INVALID_HANDLE_VALUE) {
+        CloseHandle(ctx->pipeOut);
+        ctx->pipeOut = INVALID_HANDLE_VALUE;
+    }
+
+    if (ctx->inputHandler != INVALID_HANDLE_VALUE) {
+        WaitForSingleObject(ctx->inputHandler, 1000);
+    }
+
+    SetConsoleMode(hStdin, ctx->originalConsoleMode);
+}
+
+static void __cdecl ResizeHandlerThread(LPVOID arg) {
+    Context* ctx = arg;
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    COORD currentSize = {0, 0};
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+
+    if (GetConsoleScreenBufferInfo(hConsole, &csbi)) {
+        currentSize.X = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+        currentSize.Y = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+    }
+
+    while (WaitForMultipleObjects(sizeof(ctx->events) / sizeof(HANDLE), ctx->events, FALSE, 100) ==
+           WAIT_TIMEOUT) {
+        if (GetConsoleScreenBufferInfo(hConsole, &csbi)) {
+            COORD newSize;
+            newSize.X = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+            newSize.Y = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+
+            if (newSize.X != currentSize.X || newSize.Y != currentSize.Y) {
+                currentSize = newSize;
+                ResizePseudoConsole(ctx->hpcon, currentSize);
+            }
+        }
+    }
 }

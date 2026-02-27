@@ -8,6 +8,14 @@ To run sshpass, you must install:
 
 - Windows 10 Insider build 17733 or later
 
+# Install
+
+## Winget
+
+```sh
+winget install xhcoding.sshpass-win32
+```
+
 # Usage
 
 ```sh

@@ -26,6 +26,7 @@ jobs:
 
       - name: Publish to Winget
         uses: vedantmgoyal9/winget-releaser@main
+        if: startsWith(github.ref, 'refs/tags/')
         with:
           identifier: xhcoding.sshpass-win32
           token: ${{ secrets.WINGET_TOKEN }}

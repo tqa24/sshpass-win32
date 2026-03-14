@@ -16,6 +16,12 @@ To run sshpass, you must install:
 winget install xhcoding.sshpass-win32
 ```
 
+## Scoop
+
+```sh
+scoop install sshpass
+```
+
 # Usage
 
 ```sh
